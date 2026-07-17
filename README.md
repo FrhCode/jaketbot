@@ -14,7 +14,7 @@ Small Go app that checks website keyword and sends Telegram alert when keyword a
 3. Read `chat.id` from response.
 
 ## `.env`
-Copy `.env.example` to `.env` and fill:
+Copy `.env.example` to `.env` and fill. The app reads `.env` automatically when run from project folder.
 - `KEYWORD` required
 - `TELEGRAM_BOT_TOKEN` required
 - `TELEGRAM_CHAT_IDS` required, comma-separated

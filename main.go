@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,14 +16,14 @@ import (
 )
 
 type Config struct {
-	WatchURL            string
-	Keyword             string
-	CheckInterval       time.Duration
-	TelegramBotToken    string
-	TelegramChatIDs     []string
-	StateFile           string
-	HTTPTimeout         time.Duration
-	UserAgent           string
+	WatchURL         string
+	Keyword          string
+	CheckInterval    time.Duration
+	TelegramBotToken string
+	TelegramChatIDs  []string
+	StateFile        string
+	HTTPTimeout      time.Duration
+	UserAgent        string
 }
 
 type State struct {
@@ -71,6 +72,7 @@ func main() {
 }
 
 func loadConfig() (Config, error) {
+	loadDotEnv(".env")
 	watchURL := getenv("WATCH_URL", "https://jaketboat.bankjakarta.co.id/")
 	keyword := strings.TrimSpace(os.Getenv("KEYWORD"))
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
@@ -110,6 +112,35 @@ func loadConfig() (Config, error) {
 		HTTPTimeout:      time.Duration(timeoutSeconds) * time.Second,
 		UserAgent:        ua,
 	}, nil
+}
+
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if key == "" {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		_ = os.Setenv(key, strings.Trim(val, `"`))
+	}
 }
 
 func getenv(key, fallback string) string {
