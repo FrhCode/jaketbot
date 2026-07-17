@@ -12,8 +12,39 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+type logBuffer struct {
+	mu    sync.Mutex
+	limit int
+	lines []string
+}
+
+func newLogBuffer(limit int) *logBuffer {
+	return &logBuffer{limit: limit}
+}
+
+func (b *logBuffer) add(line string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lines = append(b.lines, line)
+	if len(b.lines) > b.limit {
+		b.lines = b.lines[len(b.lines)-b.limit:]
+	}
+}
+
+func (b *logBuffer) tail(n int) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > len(b.lines) {
+		n = len(b.lines)
+	}
+	out := make([]string, n)
+	copy(out, b.lines[len(b.lines)-n:])
+	return out
+}
 
 type Config struct {
 	WatchURL         string
@@ -49,6 +80,8 @@ func main() {
 
 	state := loadState(cfg.StateFile)
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	logs := newLogBuffer(100)
+	go pollTelegramCommands(client, cfg, logs)
 	ticker := time.NewTicker(cfg.CheckInterval)
 	defer ticker.Stop()
 
@@ -56,25 +89,25 @@ func main() {
 		now := time.Now().UTC()
 		found, err := checkKeyword(client, cfg)
 		if err != nil {
-			log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, err)
+			logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, err)
 			if !state.FailureAlerted {
 				if alertErr := sendFailureAlerts(client, cfg, now, err); alertErr != nil {
-					log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, alertErr)
+					logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, alertErr)
 				}
 				state.FailureAlerted = true
 				state.CheckedAt = now
 				if saveErr := saveState(cfg.StateFile, state); saveErr != nil {
-					log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, saveErr)
+					logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, saveErr)
 				}
 			}
 			return
 		}
 
-		log.Printf("time=%s url=%s keyword_found=%t", now.Format(time.RFC3339), cfg.WatchURL, found)
+		logLine(logs, "time=%s url=%s keyword_found=%t", now.Format(time.RFC3339), cfg.WatchURL, found)
 
 		if found {
 			if err := sendTelegramAlerts(client, cfg, now); err != nil {
-				log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, found, err)
+				logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, found, err)
 			}
 		}
 
@@ -82,7 +115,7 @@ func main() {
 		state.FailureAlerted = false
 		state.CheckedAt = now
 		if err := saveState(cfg.StateFile, state); err != nil {
-			log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, found, err)
+			logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, found, err)
 		}
 	}
 
@@ -90,6 +123,12 @@ func main() {
 	for range ticker.C {
 		check()
 	}
+}
+
+func logLine(logs *logBuffer, format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	logs.add(line)
+	log.Print(line)
 }
 
 func loadConfig() (Config, error) {
@@ -301,6 +340,77 @@ func sendTelegramText(client *http.Client, cfg Config, message string) error {
 		}
 	}
 	return nil
+}
+
+type telegramUpdatesResponse struct {
+	OK     bool `json:"ok"`
+	Result []struct {
+		UpdateID int `json:"update_id"`
+		Message  *struct {
+			Text string `json:"text"`
+			Chat struct {
+				ID int64 `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	} `json:"result"`
+}
+
+func pollTelegramCommands(client *http.Client, cfg Config, logs *logBuffer) {
+	var offset int
+	for {
+		updates, err := getTelegramUpdates(client, cfg.TelegramBotToken, offset)
+		if err != nil {
+			logLine(logs, "telegram_command_error=%v", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		for _, update := range updates.Result {
+			offset = update.UpdateID + 1
+			if update.Message == nil || strings.TrimSpace(update.Message.Text) != "/logs" {
+				continue
+			}
+			if !chatAllowed(update.Message.Chat.ID, cfg.TelegramChatIDs) {
+				continue
+			}
+			lines := logs.tail(10)
+			message := "No logs yet"
+			if len(lines) > 0 {
+				message = strings.Join(lines, "\n")
+			}
+			if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), message); err != nil {
+				logLine(logs, "telegram_command_error=%v", err)
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func getTelegramUpdates(client *http.Client, token string, offset int) (telegramUpdatesResponse, error) {
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=1&offset=%d", token, offset)
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return telegramUpdatesResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return telegramUpdatesResponse{}, fmt.Errorf("telegram getUpdates failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var updates telegramUpdatesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&updates); err != nil {
+		return telegramUpdatesResponse{}, err
+	}
+	return updates, nil
+}
+
+func chatAllowed(chatID int64, allowed []string) bool {
+	id := strconv.FormatInt(chatID, 10)
+	for _, chat := range allowed {
+		if chat == id {
+			return true
+		}
+	}
+	return false
 }
 
 func sendTelegramMessage(client *http.Client, token, chatID, message string) error {
