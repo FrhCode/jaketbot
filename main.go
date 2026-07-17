@@ -157,7 +157,7 @@ func loadConfig() (Config, error) {
 	watchBody := getenv("WATCH_BODY", defaultWatchBody)
 	watchContentType := getenv("WATCH_CONTENT_TYPE", "text/plain;charset=UTF-8")
 	watchHeaders := defaultWatchHeaders()
-	applyCurlConfig(getenv("WATCH_CURL", ""), &watchURL, &watchMethod, &watchBody, &watchContentType, &watchHeaders)
+	_ = applyCurlConfig(getenv("WATCH_CURL", ""), &watchURL, &watchMethod, &watchBody, &watchContentType, &watchHeaders)
 	keyword := strings.TrimSpace(os.Getenv("KEYWORD"))
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	chatIDsRaw := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_IDS"))
@@ -202,9 +202,13 @@ func loadConfig() (Config, error) {
 	}, nil
 }
 
-func applyCurlConfig(raw string, watchURL *string, watchMethod *string, watchBody *string, watchContentType *string, watchHeaders *http.Header) {
+func applyCurlConfig(raw string, watchURL *string, watchMethod *string, watchBody *string, watchContentType *string, watchHeaders *http.Header) bool {
 	if strings.TrimSpace(raw) == "" {
-		return
+		return false
+	}
+	headers, body, ok := parseCurl(raw)
+	if !ok {
+		return false
 	}
 	*watchMethod = http.MethodPost
 	*watchBody = "[]"
@@ -212,14 +216,13 @@ func applyCurlConfig(raw string, watchURL *string, watchMethod *string, watchBod
 	if parsed, ok := parseCurlURL(raw); ok {
 		*watchURL = parsed
 	}
-	if headers, body, ok := parseCurl(raw); ok {
-		for k, v := range headers {
-			watchHeaders.Set(k, v)
-		}
-		if body != "" {
-			*watchBody = body
-		}
+	for k, v := range headers {
+		watchHeaders.Set(k, v)
 	}
+	if body != "" {
+		*watchBody = body
+	}
+	return true
 }
 
 func parseCurlURL(raw string) (string, bool) {
@@ -508,7 +511,12 @@ func pollTelegramCommands(client *http.Client, runtime *runtimeConfig, logs *log
 			case strings.HasPrefix(text, "/curl "):
 				curl := strings.TrimSpace(strings.TrimPrefix(text, "/curl "))
 				next := cfg
-				applyCurlConfig(curl, &next.WatchURL, &next.WatchMethod, &next.WatchBody, &next.WatchContentType, &next.WatchHeaders)
+				if !applyCurlConfig(curl, &next.WatchURL, &next.WatchMethod, &next.WatchBody, &next.WatchContentType, &next.WatchHeaders) {
+					if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), "Invalid curl. Send full Copy as cURL, not /curl test."); err != nil {
+						logLine(logs, "telegram_command_error=%v", err)
+					}
+					continue
+				}
 				runtime.set(next)
 				logLine(logs, "watch curl updated by chat_id=%d", update.Message.Chat.ID)
 				if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), "Curl updated for current process. Restart loses it unless WATCH_CURL is saved in .env."); err != nil {
