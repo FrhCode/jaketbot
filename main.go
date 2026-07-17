@@ -217,12 +217,16 @@ func applyCurlConfig(raw string, watchURL *string, watchMethod *string, watchBod
 		*watchURL = parsed
 	}
 	for k, v := range headers {
-		watchHeaders.Set(k, v)
+		watchHeaders.Set(k, normalizeHeaderValue(v))
 	}
 	if body != "" {
 		*watchBody = body
 	}
 	return true
+}
+
+func normalizeHeaderValue(v string) string {
+	return strings.ReplaceAll(v, "%22_PAGE_%22", "%22__PAGE__%22")
 }
 
 func parseCurlURL(raw string) (string, bool) {
