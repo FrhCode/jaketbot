@@ -109,15 +109,13 @@ func main() {
 		found, err := checkKeyword(client, cfg)
 		if err != nil {
 			logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, err)
-			if !state.FailureAlerted {
-				if alertErr := sendFailureAlerts(client, cfg, now, err); alertErr != nil {
-					logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, alertErr)
-				}
-				state.FailureAlerted = true
-				state.CheckedAt = now
-				if saveErr := saveState(cfg.StateFile, state); saveErr != nil {
-					logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, saveErr)
-				}
+			if alertErr := sendFailureAlerts(client, cfg, now, err); alertErr != nil {
+				logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, alertErr)
+			}
+			state.FailureAlerted = true
+			state.CheckedAt = now
+			if saveErr := saveState(cfg.StateFile, state); saveErr != nil {
+				logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, saveErr)
 			}
 			return
 		}
