@@ -48,6 +48,14 @@ docker compose logs -f
 3. Watch logs for `keyword_found=true`.
 4. Telegram alert send only on false-to-true change.
 
+## Telegram commands
+Send these from allowed chat/group:
+- `/commands` → list commands
+- `/pause` → pause website checks
+- `/start` → resume website checks
+- `/logs` → send last 10 in-memory logs
+- `/curl <copy-as-curl>` → update request until process restarts
+
 ## Local test
 ```bash
 go test ./...

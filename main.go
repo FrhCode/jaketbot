@@ -16,6 +16,19 @@ import (
 	"time"
 )
 
+type runtimeConfig struct {
+	mu     sync.RWMutex
+	cfg    Config
+	paused bool
+}
+
+func newRuntimeConfig(cfg Config) *runtimeConfig { return &runtimeConfig{cfg: cfg} }
+func (r *runtimeConfig) get() Config             { r.mu.RLock(); defer r.mu.RUnlock(); return r.cfg }
+func (r *runtimeConfig) set(cfg Config)          { r.mu.Lock(); r.cfg = cfg; r.mu.Unlock() }
+func (r *runtimeConfig) pause()                  { r.mu.Lock(); r.paused = true; r.mu.Unlock() }
+func (r *runtimeConfig) resume()                 { r.mu.Lock(); r.paused = false; r.mu.Unlock() }
+func (r *runtimeConfig) isPaused() bool          { r.mu.RLock(); defer r.mu.RUnlock(); return r.paused }
+
 type logBuffer struct {
 	mu    sync.Mutex
 	limit int
@@ -78,15 +91,21 @@ func main() {
 		log.Fatal(err)
 	}
 
+	runtime := newRuntimeConfig(cfg)
 	state := loadState(cfg.StateFile)
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	logs := newLogBuffer(100)
-	go pollTelegramCommands(client, cfg, logs)
+	go pollTelegramCommands(client, runtime, logs)
 	ticker := time.NewTicker(cfg.CheckInterval)
 	defer ticker.Stop()
 
 	check := func() {
 		now := time.Now().UTC()
+		cfg := runtime.get()
+		if runtime.isPaused() {
+			logLine(logs, "time=%s url=%s paused=true", now.Format(time.RFC3339), cfg.WatchURL)
+			return
+		}
 		found, err := checkKeyword(client, cfg)
 		if err != nil {
 			logLine(logs, "time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, err)
@@ -138,6 +157,7 @@ func loadConfig() (Config, error) {
 	watchBody := getenv("WATCH_BODY", defaultWatchBody)
 	watchContentType := getenv("WATCH_CONTENT_TYPE", "text/plain;charset=UTF-8")
 	watchHeaders := defaultWatchHeaders()
+	applyCurlConfig(getenv("WATCH_CURL", ""), &watchURL, &watchMethod, &watchBody, &watchContentType, &watchHeaders)
 	keyword := strings.TrimSpace(os.Getenv("KEYWORD"))
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	chatIDsRaw := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_IDS"))
@@ -180,6 +200,75 @@ func loadConfig() (Config, error) {
 		HTTPTimeout:      time.Duration(timeoutSeconds) * time.Second,
 		UserAgent:        ua,
 	}, nil
+}
+
+func applyCurlConfig(raw string, watchURL *string, watchMethod *string, watchBody *string, watchContentType *string, watchHeaders *http.Header) {
+	if strings.TrimSpace(raw) == "" {
+		return
+	}
+	*watchMethod = http.MethodPost
+	*watchBody = "[]"
+	*watchContentType = "text/plain;charset=UTF-8"
+	if parsed, ok := parseCurlURL(raw); ok {
+		*watchURL = parsed
+	}
+	if headers, body, ok := parseCurl(raw); ok {
+		for k, v := range headers {
+			watchHeaders.Set(k, v)
+		}
+		if body != "" {
+			*watchBody = body
+		}
+	}
+}
+
+func parseCurlURL(raw string) (string, bool) {
+	idx := strings.Index(raw, "curl '")
+	if idx < 0 {
+		idx = strings.Index(raw, "curl \"")
+		if idx < 0 {
+			return "", false
+		}
+	}
+	start := strings.Index(raw[idx:], "https://")
+	if start < 0 {
+		return "", false
+	}
+	s := raw[idx+start:]
+	end := strings.IndexAny(s, "' \n")
+	if end < 0 {
+		end = len(s)
+	}
+	return s[:end], true
+}
+
+func parseCurl(raw string) (map[string]string, string, bool) {
+	headers := map[string]string{}
+	lines := strings.Split(raw, "\n")
+	var body string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "-H '") || strings.Contains(line, "-H \"") {
+			parts := strings.SplitN(line, "-H ", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			val := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[1]), "\\"))
+			val = strings.TrimSpace(strings.Trim(val, "'\""))
+			if k, v, ok := strings.Cut(val, ":"); ok {
+				headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+			}
+		}
+		if strings.HasPrefix(line, "--data-raw ") {
+			body = strings.TrimSpace(strings.TrimPrefix(line, "--data-raw "))
+			body = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(body), "\\"))
+			body = strings.Trim(body, "'\"")
+		}
+	}
+	if len(headers) == 0 && body == "" {
+		return nil, "", false
+	}
+	return headers, body, true
 }
 
 func loadDotEnv(path string) {
@@ -355,9 +444,10 @@ type telegramUpdatesResponse struct {
 	} `json:"result"`
 }
 
-func pollTelegramCommands(client *http.Client, cfg Config, logs *logBuffer) {
+func pollTelegramCommands(client *http.Client, runtime *runtimeConfig, logs *logBuffer) {
 	var offset int
 	for {
+		cfg := runtime.get()
 		updates, err := getTelegramUpdates(client, cfg.TelegramBotToken, offset)
 		if err != nil {
 			logLine(logs, "telegram_command_error=%v", err)
@@ -366,19 +456,46 @@ func pollTelegramCommands(client *http.Client, cfg Config, logs *logBuffer) {
 		}
 		for _, update := range updates.Result {
 			offset = update.UpdateID + 1
-			if update.Message == nil || strings.TrimSpace(update.Message.Text) != "/logs" {
+			if update.Message == nil {
 				continue
 			}
+			text := strings.TrimSpace(update.Message.Text)
 			if !chatAllowed(update.Message.Chat.ID, cfg.TelegramChatIDs) {
 				continue
 			}
-			lines := logs.tail(10)
-			message := "No logs yet"
-			if len(lines) > 0 {
-				message = strings.Join(lines, "\n")
-			}
-			if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), message); err != nil {
-				logLine(logs, "telegram_command_error=%v", err)
+			switch {
+			case text == "/commands":
+				if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), commandList()); err != nil {
+					logLine(logs, "telegram_command_error=%v", err)
+				}
+			case text == "/pause":
+				runtime.pause()
+				if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), "Paused."); err != nil {
+					logLine(logs, "telegram_command_error=%v", err)
+				}
+			case text == "/start":
+				runtime.resume()
+				if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), "Started."); err != nil {
+					logLine(logs, "telegram_command_error=%v", err)
+				}
+			case text == "/logs":
+				lines := logs.tail(10)
+				message := "No logs yet"
+				if len(lines) > 0 {
+					message = strings.Join(lines, "\n")
+				}
+				if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), message); err != nil {
+					logLine(logs, "telegram_command_error=%v", err)
+				}
+			case strings.HasPrefix(text, "/curl "):
+				curl := strings.TrimSpace(strings.TrimPrefix(text, "/curl "))
+				next := cfg
+				applyCurlConfig(curl, &next.WatchURL, &next.WatchMethod, &next.WatchBody, &next.WatchContentType, &next.WatchHeaders)
+				runtime.set(next)
+				logLine(logs, "watch curl updated by chat_id=%d", update.Message.Chat.ID)
+				if err := sendTelegramMessage(client, cfg.TelegramBotToken, strconv.FormatInt(update.Message.Chat.ID, 10), "Curl updated for current process. Restart loses it unless WATCH_CURL is saved in .env."); err != nil {
+					logLine(logs, "telegram_command_error=%v", err)
+				}
 			}
 		}
 		time.Sleep(3 * time.Second)
@@ -401,6 +518,10 @@ func getTelegramUpdates(client *http.Client, token string, offset int) (telegram
 		return telegramUpdatesResponse{}, err
 	}
 	return updates, nil
+}
+
+func commandList() string {
+	return "/commands - list command\n/pause - pause watch\n/start - resume watch\n/logs - last 10 log\n/curl ... - update request"
 }
 
 func chatAllowed(chatID int64, allowed []string) bool {
@@ -439,3 +560,4 @@ func sendTelegramMessage(client *http.Client, token, chatID, message string) err
 
 // ponytail: state is single-file JSON for MVP; upgrade to DB only if multi-instance or audit trail needed.
 // ponytail: hardcoded Next.js request headers are acceptable until site rotates server-action payload.
+// ponytail: /curl command updates runtime only; persist by saving WATCH_CURL in .env.
