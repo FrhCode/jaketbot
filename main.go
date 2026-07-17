@@ -259,6 +259,11 @@ func parseCurl(raw string) (map[string]string, string, bool) {
 				headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
 			}
 		}
+		if strings.Contains(line, " -b ") || strings.HasPrefix(line, "-b ") {
+			if cookie := parseCurlCookie(line); cookie != "" {
+				headers["Cookie"] = cookie
+			}
+		}
 		if strings.HasPrefix(line, "--data-raw ") {
 			body = strings.TrimSpace(strings.TrimPrefix(line, "--data-raw "))
 			body = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(body), "\\"))
@@ -269,6 +274,19 @@ func parseCurl(raw string) (map[string]string, string, bool) {
 		return nil, "", false
 	}
 	return headers, body, true
+}
+
+func parseCurlCookie(line string) string {
+	idx := strings.Index(line, "-b ")
+	if idx < 0 {
+		return ""
+	}
+	v := strings.TrimSpace(line[idx+3:])
+	v = strings.TrimSuffix(v, "\\")
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "$")
+	v = strings.Trim(v, "'\"")
+	return strings.ReplaceAll(v, `\u0021`, "!")
 }
 
 func loadDotEnv(path string) {
