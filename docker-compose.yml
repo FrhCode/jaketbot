@@ -1,0 +1,10 @@
+services:
+  website-watcher:
+    build: .
+    env_file: .env
+    volumes:
+      - watcher_data:/data
+    restart: unless-stopped
+
+volumes:
+  watcher_data:

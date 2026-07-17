@@ -1,0 +1,20 @@
+# env/secrets
+.env
+.env.*
+!.env.example
+
+# build output
+website-watcher
+*.exe
+*.test
+
+# Go
+coverage.out
+
+# Docker/local data
+data/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
