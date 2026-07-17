@@ -17,6 +17,10 @@ import (
 
 type Config struct {
 	WatchURL         string
+	WatchMethod      string
+	WatchBody        string
+	WatchContentType string
+	WatchHeaders     http.Header
 	Keyword          string
 	CheckInterval    time.Duration
 	TelegramBotToken string
@@ -26,9 +30,15 @@ type Config struct {
 	UserAgent        string
 }
 
+const (
+	defaultWatchMethod = http.MethodPost
+	defaultWatchBody   = "[]"
+)
+
 type State struct {
-	Found     bool      `json:"found"`
-	CheckedAt time.Time `json:"checked_at"`
+	Found          bool      `json:"found"`
+	FailureAlerted bool      `json:"failure_alerted"`
+	CheckedAt      time.Time `json:"checked_at"`
 }
 
 func main() {
@@ -44,9 +54,19 @@ func main() {
 
 	check := func() {
 		now := time.Now().UTC()
-		found, err := checkKeyword(client, cfg.WatchURL, cfg.Keyword, cfg.UserAgent)
+		found, err := checkKeyword(client, cfg)
 		if err != nil {
 			log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, err)
+			if !state.FailureAlerted {
+				if alertErr := sendFailureAlerts(client, cfg, now, err); alertErr != nil {
+					log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, alertErr)
+				}
+				state.FailureAlerted = true
+				state.CheckedAt = now
+				if saveErr := saveState(cfg.StateFile, state); saveErr != nil {
+					log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, false, saveErr)
+				}
+			}
 			return
 		}
 
@@ -59,6 +79,7 @@ func main() {
 		}
 
 		state.Found = found
+		state.FailureAlerted = false
 		state.CheckedAt = now
 		if err := saveState(cfg.StateFile, state); err != nil {
 			log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, found, err)
@@ -74,6 +95,10 @@ func main() {
 func loadConfig() (Config, error) {
 	loadDotEnv(".env")
 	watchURL := getenv("WATCH_URL", "https://jaketboat.bankjakarta.co.id/")
+	watchMethod := strings.ToUpper(getenv("WATCH_METHOD", defaultWatchMethod))
+	watchBody := getenv("WATCH_BODY", defaultWatchBody)
+	watchContentType := getenv("WATCH_CONTENT_TYPE", "text/plain;charset=UTF-8")
+	watchHeaders := defaultWatchHeaders()
 	keyword := strings.TrimSpace(os.Getenv("KEYWORD"))
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	chatIDsRaw := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_IDS"))
@@ -104,6 +129,10 @@ func loadConfig() (Config, error) {
 
 	return Config{
 		WatchURL:         watchURL,
+		WatchMethod:      watchMethod,
+		WatchBody:        watchBody,
+		WatchContentType: watchContentType,
+		WatchHeaders:     watchHeaders,
 		Keyword:          keyword,
 		CheckInterval:    time.Duration(intervalSeconds) * time.Second,
 		TelegramBotToken: token,
@@ -174,12 +203,35 @@ func containsKeyword(body, keyword string) bool {
 	return strings.Contains(strings.ToLower(body), strings.ToLower(keyword))
 }
 
-func checkKeyword(client *http.Client, watchURL, keyword, userAgent string) (bool, error) {
-	req, err := http.NewRequest(http.MethodGet, watchURL, nil)
+func defaultWatchHeaders() http.Header {
+	h := http.Header{}
+	// ponytail: hardcoded Next.js Server Action headers from working public request; refresh these if failure alert says request rotated.
+	h.Set("Accept", "text/x-component")
+	h.Set("Origin", "https://jaketboat.bankjakarta.co.id")
+	h.Set("Referer", "https://jaketboat.bankjakarta.co.id/")
+	h.Set("next-action", "006a9e3ed84d13a4d62ca881933c8231ac804caff2")
+	h.Set("next-router-state-tree", "%5B%22%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C16%5D")
+	return h
+}
+
+func checkKeyword(client *http.Client, cfg Config) (bool, error) {
+	var body io.Reader
+	if cfg.WatchBody != "" {
+		body = strings.NewReader(cfg.WatchBody)
+	}
+	req, err := http.NewRequest(cfg.WatchMethod, cfg.WatchURL, body)
 	if err != nil {
 		return false, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", cfg.UserAgent)
+	if cfg.WatchBody != "" {
+		req.Header.Set("Content-Type", cfg.WatchContentType)
+	}
+	for key, values := range cfg.WatchHeaders {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -195,7 +247,7 @@ func checkKeyword(client *http.Client, watchURL, keyword, userAgent string) (boo
 	if err != nil {
 		return false, err
 	}
-	return containsKeyword(string(b), keyword), nil
+	return containsKeyword(string(b), cfg.Keyword), nil
 }
 
 func loadState(path string) State {
@@ -233,17 +285,26 @@ func dirOf(path string) string {
 }
 
 func sendTelegramAlerts(client *http.Client, cfg Config, now time.Time) error {
+	message := fmt.Sprintf("Keyword ditemukan\nURL: %s\nKeyword: %s\nTime: %s", cfg.WatchURL, cfg.Keyword, now.Format(time.RFC3339))
+	return sendTelegramText(client, cfg, message)
+}
+
+func sendFailureAlerts(client *http.Client, cfg Config, now time.Time, cause error) error {
+	message := fmt.Sprintf("Website watcher gagal\nURL: %s\nError: %s\nTime: %s\nAction: cek apakah next-action / next-router-state-tree sudah rotate", cfg.WatchURL, cause, now.Format(time.RFC3339))
+	return sendTelegramText(client, cfg, message)
+}
+
+func sendTelegramText(client *http.Client, cfg Config, message string) error {
 	for _, chatID := range cfg.TelegramChatIDs {
-		if err := sendTelegramMessage(client, cfg.TelegramBotToken, chatID, cfg.WatchURL, cfg.Keyword, now); err != nil {
+		if err := sendTelegramMessage(client, cfg.TelegramBotToken, chatID, message); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func sendTelegramMessage(client *http.Client, token, chatID, watchURL, keyword string, now time.Time) error {
+func sendTelegramMessage(client *http.Client, token, chatID, message string) error {
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	message := fmt.Sprintf("Keyword ditemukan\nURL: %s\nKeyword: %s\nTime: %s", watchURL, keyword, now.Format(time.RFC3339))
 	form := url.Values{}
 	form.Set("chat_id", chatID)
 	form.Set("text", message)
@@ -267,3 +328,4 @@ func sendTelegramMessage(client *http.Client, token, chatID, watchURL, keyword s
 }
 
 // ponytail: state is single-file JSON for MVP; upgrade to DB only if multi-instance or audit trail needed.
+// ponytail: hardcoded Next.js request headers are acceptable until site rotates server-action payload.
