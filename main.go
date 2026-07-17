@@ -72,7 +72,7 @@ func main() {
 
 		log.Printf("time=%s url=%s keyword_found=%t", now.Format(time.RFC3339), cfg.WatchURL, found)
 
-		if found && !state.Found {
+		if found {
 			if err := sendTelegramAlerts(client, cfg, now); err != nil {
 				log.Printf("time=%s url=%s keyword_found=%t error=%v", now.Format(time.RFC3339), cfg.WatchURL, found, err)
 			}
